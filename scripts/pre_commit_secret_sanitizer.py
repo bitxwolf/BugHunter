@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import pathlib
 import re
 import subprocess
@@ -33,11 +32,10 @@ PATTERNS = {
     "private_key": re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"),
     "generic_assignment": re.compile(
         r"""(?ix)
-        (?:['"]?[a-z0-9_]*(?:api[_-]?key|secret|token|password|auth_token)[a-z0-9_]*['"]?)
+        (?:['\"]?[a-z0-9_]*(?:api[_-]?key|secret|token|password|auth_token)[a-z0-9_]*['\"]?)
         (?:\s*:\s*[^=:\r\n"'{}]{1,50}\s*=\s*|\s*[:=]\s*)
         (?:[brfBRF]{1,2})?
-        (?:
-            (?P<quote>['"`]{1,3})
+        (?:(?P<quote>['\"`]{1,3})
             (?P<val_quoted>[A-Za-z0-9_\-+/=.@$!%*?&#~^]{20,})
             (?P=quote)
         |
@@ -143,7 +141,7 @@ def is_blocked_file(filepath: str) -> bool:
 
     Returns True if file is blocked, False if clean.
     """
-    normalized = filepath.strip().strip('"\'').replace("\\", "/")
+    normalized = filepath.strip().strip('"\\'').replace("\\", "/")
     filename = pathlib.PurePosixPath(normalized).name
     filename_lower = filename.lower()
 
@@ -169,7 +167,7 @@ def check_blocked_file(filepath: str) -> Optional[str]:
 
     Returns explanation reason if blocked, None if clean.
     """
-    normalized = filepath.strip().strip('"\'').replace("\\", "/")
+    normalized = filepath.strip().strip('"\\'').replace("\\", "/")
     filename = pathlib.PurePosixPath(normalized).name
     filename_lower = filename.lower()
 
@@ -220,7 +218,7 @@ def scan_text_for_secrets(text: str) -> List[Tuple[str, str]]:
                 continue
 
         lines_to_check = [raw_line]
-        deconcatenated = re.sub(r"""['"`]\s*\+\s*['"`]""", "", raw_line)
+        deconcatenated = re.sub(r"['\"`]\s*\+\s*['\"`]", "", raw_line)
         if deconcatenated != raw_line:
             lines_to_check.append(deconcatenated)
 
@@ -284,7 +282,7 @@ def get_staged_files(repo_path: str = ".") -> List[str]:
             errors="replace",
             check=True,
         )
-        return [f.strip().strip('"\'') for f in res.stdout.splitlines() if f.strip()]
+        return [f.strip().strip('"\\'') for f in res.stdout.splitlines() if f.strip()]
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         sys.stderr.write(f"Git error checking staged files: {e}\n")
         return []
