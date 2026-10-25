@@ -44,7 +44,6 @@ from scripts.install_hooks import (
 from scripts.pre_commit_secret_sanitizer import (
     is_blocked_file,
     scan_text_for_secrets,
-    shannon_entropy,
 )
 
 
