@@ -20,7 +20,6 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from pre_commit_secret_sanitizer import (
-    PATTERNS,
     BLOCKED_NAMES,
     BLOCKED_EXTENSIONS,
     shannon_entropy,
