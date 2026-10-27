@@ -29,7 +29,7 @@ from install_hooks import (
     check_hook_installed,
     main as install_main,
 )
-import pre_commit_secret_sanitizer
+
 from pre_commit_secret_sanitizer import (
     main as sanitizer_main,
     scan_text_for_secrets,
