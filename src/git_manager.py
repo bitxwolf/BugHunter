@@ -70,6 +70,8 @@ class GitManager:
         scrubbed = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{20,}", "bearer [REDACTED]", scrubbed)
         scrubbed = re.sub(r"http\.https://github\.com/\.extraHeader=[^\s'\"]+", "http.https://github.com/.extraHeader=[REDACTED]", scrubbed)
         scrubbed = re.sub(r"http\.extraHeader=[^\s'\"]+", "http.extraHeader=[REDACTED]", scrubbed)
+        scrubbed = re.sub(r"(https?://)([^:\s/@]+):([^@\s/]+)@", r"\1\2:[REDACTED]@", scrubbed)
+        scrubbed = re.sub(r"(https?://)([^@\s/:]+)@([a-zA-Z0-9_.-]+)", r"\1[REDACTED]@\3", scrubbed)
         return scrubbed
 
     def _gh_env(self) -> dict[str, str]:

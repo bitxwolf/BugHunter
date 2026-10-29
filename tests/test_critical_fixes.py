@@ -2,17 +2,19 @@
 Unit and boundary tests for Critical Bug Fixes:
 1. Google AIza API Key Redaction Regex in src/logger.py and src/verifier.py
 2. Credential scrubbing in FixResult.error_message and ReviewRemediationResult.error_message
-3. RingBufferLogger.get_recent() alias contract
+3. RingBufferLogger.get_recent() alias contract and boundaries
 """
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from src.aider_runner import AiderResult
 from src.fixer_agent import FixResult, MainFixerAgent
 from src.git_manager import GitManager
 from src.logger import RingBufferLogger, redact_secrets
-from src.review_monitor import ReviewMonitor, ReviewRemediationResult
-from src.verifier import Verifier
+from src.review_monitor import ReviewComment, ReviewMonitor, ReviewRemediationResult
+from src.verifier import VerificationResult, Verifier
 
 # ==============================================================================
 # Critical Issue 1: Google AIza API Key Redaction Regex
@@ -28,7 +30,7 @@ def test_aiza_regex_variable_lengths_in_logger():
         _make_dummy_token("AI", "za", "a" * 30),                              # 30 chars
         _make_dummy_token("AI", "za", "a" * 34),                              # 34 chars (reported issue)
         _make_dummy_token("AI", "za", "B" * 35),                              # 35 chars (standard)
-        _make_dummy_token("AI", "zaSy", "A" * 33),                             # 39 chars (Google standard format)
+        _make_dummy_token("AI", "zaSy", "A" * 33),                            # 39 chars (Google standard format)
         _make_dummy_token("AI", "za", "x-y_z" * 8),                           # 40 chars with - and _
         _make_dummy_token("AI", "za", "Z" * 45),                              # 45 chars max bound
     ]
@@ -164,6 +166,156 @@ def test_review_monitor_execute_graphql_scrubs_errors():
         assert "[REDACTED]" in err_msg
 
 
+def test_authenticated_url_scrubbing_across_agents():
+    """Verify _scrub and redact_secrets thoroughly redact URLs with user:password, x-access-token, and tokens."""
+    agent = MainFixerAgent()
+    monitor = ReviewMonitor(config=None, database=None, git_manager=None, verifier=Verifier())
+
+    sensitive_urls = [
+        ("fatal: https://x-access-token:customSecretToken12345@github.com/org/repo.git",
+         "https://x-access-token:[REDACTED]@github.com/org/repo.git"),
+        ("error: https://bitxwolf:superSecretPassword987@github.com/org/repo.git",
+         "https://bitxwolf:[REDACTED]@github.com/org/repo.git"),
+        ("push failed: https://myTokenAlphaNumeric12345@github.com/org/repo.git",
+         "https://[REDACTED]@github.com/org/repo.git"),
+    ]
+
+    for raw, expected in sensitive_urls:
+        agent_scrubbed = agent._scrub(raw)
+        monitor_scrubbed = monitor._scrub(raw)
+        redact_direct = redact_secrets(raw)
+
+        assert expected in agent_scrubbed, f"Agent failed on {raw}: got {agent_scrubbed}"
+        assert expected in monitor_scrubbed, f"Monitor failed on {raw}: got {monitor_scrubbed}"
+        assert expected in redact_direct, f"Direct redact failed on {raw}: got {redact_direct}"
+        assert "customSecretToken12345" not in agent_scrubbed
+        assert "superSecretPassword987" not in agent_scrubbed
+        assert "myTokenAlphaNumeric12345" not in agent_scrubbed
+
+
+def test_post_init_defence_in_depth_scrubbing():
+    """Verify FixResult and ReviewRemediationResult __post_init__ redacts secrets even when unscrubbed string is passed."""
+    secret_pass = "topSecretPass123456"
+    raw_msg = f"fatal: Authentication failed for 'https://bot:{secret_pass}@github.com/org/repo.git'"
+
+    fix_res = FixResult(
+        success=False,
+        repo_slug="org/repo",
+        bug_id="BUG-001",
+        target_file="src/code.py",
+        error_message=raw_msg,
+    )
+    assert secret_pass not in (fix_res.error_message or "")
+    assert "[REDACTED]" in (fix_res.error_message or "")
+
+    review_res = ReviewRemediationResult(
+        success=False,
+        repo_slug="org/repo",
+        pr_number=5,
+        thread_id="T1",
+        comment_id="C1",
+        error_message=raw_msg,
+    )
+    assert secret_pass not in (review_res.error_message or "")
+    assert "[REDACTED]" in (review_res.error_message or "")
+
+
+def test_fixer_agent_fix_next_bug_end_to_end_push_failure_scrubs_credentials(tmp_path: Path):
+    """Verify that calling agent.fix_next_bug() scrubs credentials in FixResult on git push exception."""
+    # Set up simulated repo
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, check=True)
+    test_file = tmp_path / "main.py"
+    test_file.write_text("def run():\n    return 0\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True)
+
+    bug_log = tmp_path / "Bug-log.md"
+    bug_log.write_text("- [ ] **BUG-999**: main.py:1 - [ruff:E999] return 42 instead of 0\n", encoding="utf-8")
+
+    git_manager = MagicMock(spec=GitManager)
+    secret_url = "https://x-access-token:verySecretPushToken456@github.com/org/repo.git"
+    git_manager.push_atomic_branch.side_effect = RuntimeError(f"fatal: Authentication failed for '{secret_url}'")
+    git_manager._scrub_credentials = GitManager._scrub_credentials.__get__(git_manager, GitManager)
+
+    mock_aider = MagicMock()
+    def mock_run_aider(repo_path, target_file, patch_instruction, key_entry=None, log_callback=None):
+        (repo_path / target_file).write_text("def run():\n    return 42\n", encoding="utf-8")
+        return AiderResult(exit_code=0, diff_output="--- a/main.py\n+++ b/main.py\n@@ -1,2 +1,2 @@\n- return 0\n+ return 42\n", status="SUCCESS", target_file="main.py")
+    mock_aider.run_aider.side_effect = mock_run_aider
+
+    mock_verifier = MagicMock()
+    mock_verifier.verify_and_sanitize_fix.return_value = VerificationResult(verified=True, diff_lines=2)
+
+    agent = MainFixerAgent(git_manager=git_manager, verifier=mock_verifier, aider_runner=mock_aider)
+    res = agent.fix_next_bug("org/repo", tmp_path, bug_log_path=bug_log)
+
+    assert res.success is False
+    assert res.status == "PUSH_FAILED"
+    assert "verySecretPushToken456" not in (res.error_message or "")
+    assert "[REDACTED]" in (res.error_message or "")
+
+
+def test_review_monitor_remediate_single_thread_end_to_end_push_failure_scrubs_credentials(tmp_path: Path):
+    """Verify that calling monitor.remediate_single_thread() scrubs credentials in ReviewRemediationResult on git push exception."""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, check=True)
+    test_file = tmp_path / "foo.py"
+    test_file.write_text("def val():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "checkout", "-b", "fix/test-branch"], cwd=tmp_path, check=True)
+
+    git_manager = MagicMock(spec=GitManager)
+    secret_url = "https://botUser:botSecretPassword789@github.com/org/repo.git"
+    git_manager.push_atomic_branch.side_effect = RuntimeError(f"fatal: push error to '{secret_url}'")
+    git_manager._scrub_credentials = GitManager._scrub_credentials.__get__(git_manager, GitManager)
+
+    mock_aider = MagicMock()
+    def mock_run_aider_rm(repo_path, target_file, patch_instruction, key_entry=None, log_callback=None):
+        (repo_path / target_file).write_text("def val():\n    return 42\n", encoding="utf-8")
+        return AiderResult(exit_code=0, diff_output="--- a/foo.py\n+++ b/foo.py\n@@ -1,2 +1,2 @@\n- return 1\n+ return 42\n", status="SUCCESS", target_file="foo.py")
+    mock_aider.run_aider.side_effect = mock_run_aider_rm
+
+    mock_verifier = MagicMock()
+    mock_verifier.verify_and_sanitize_fix.return_value = VerificationResult(verified=True, diff_lines=1)
+
+    monitor = ReviewMonitor(
+        config=None,
+        database=None,
+        git_manager=git_manager,
+        verifier=mock_verifier,
+        aider_runner=mock_aider,
+    )
+
+    comment = ReviewComment(
+        comment_id="C_123",
+        thread_id="T_123",
+        repo_slug="org/repo",
+        pr_number=10,
+        branch_name="fix/test-branch",
+        path="foo.py",
+        line=1,
+        diff_hunk="",
+        body="Improve val",
+        author="reviewer",
+    )
+
+    res = monitor.remediate_single_thread(
+        repo_slug="org/repo",
+        pr_info={"number": 10, "headRefName": "fix/test-branch"},
+        comment=comment,
+        repo_path=tmp_path,
+    )
+
+    assert res.success is False
+    assert res.status == "PUSH_FAILED"
+    assert "botSecretPassword789" not in (res.error_message or "")
+    assert "[REDACTED]" in (res.error_message or "")
+
+
 # ==============================================================================
 # Critical Issue 3: RingBufferLogger.get_recent() alias
 # ==============================================================================
@@ -194,15 +346,37 @@ def test_ring_buffer_logger_get_recent_alias():
     assert len(logger.get_recent(100)) == 5
 
 
+def test_ring_buffer_logger_get_recent_zero_and_negative_counts():
+    """Verify get_recent and get_recent_logs return empty list for 0 and negative counts (boundary risk)."""
+    logger = RingBufferLogger(capacity=10)
+    for i in range(3):
+        logger.log("INFO", f"Entry {i}")
+
+    # Boundary: count = 0
+    assert logger.get_recent(0) == []
+    assert logger.get_recent_logs(0) == []
+
+    # Boundary: count < 0
+    assert logger.get_recent(-1) == []
+    assert logger.get_recent_logs(-1) == []
+    assert logger.get_recent(-10) == []
+    assert logger.get_recent_logs(-10) == []
+
+
 # ==============================================================================
 # Edge Cases & Robustness
 # ==============================================================================
 
 def test_scrub_handles_none_empty_and_various_credentials():
-    """Verify _scrub safely handles None, empty string, Bearer tokens, and Basic auth."""
+    """Verify _scrub safely handles None, empty string, Bearer tokens, Basic auth, and raw Exception objects."""
     agent = MainFixerAgent()
     assert agent._scrub(None) is None
     assert agent._scrub("") == ""
+
+    # Exception object passed instead of str
+    exc = RuntimeError("Failed connecting to https://user:pass123@github.com")
+    assert "pass123" not in agent._scrub(exc)
+    assert "[REDACTED]" in agent._scrub(exc)
 
     bearer_err = "Request failed: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.t-IDcSemACt8x4iTMCda8Yhe3iZaWbvV5XKSTbuAn0M"
     assert "Bearer [REDACTED]" in agent._scrub(bearer_err)
@@ -213,6 +387,7 @@ def test_scrub_handles_none_empty_and_various_credentials():
     monitor = ReviewMonitor(config=None, database=None, git_manager=None, verifier=Verifier())
     assert monitor._scrub(None) is None
     assert monitor._scrub("") == ""
+    assert "pass123" not in monitor._scrub(exc)
+    assert "[REDACTED]" in monitor._scrub(exc)
     assert "Bearer [REDACTED]" in monitor._scrub(bearer_err)
     assert "Basic [REDACTED]" in monitor._scrub(basic_err)
-

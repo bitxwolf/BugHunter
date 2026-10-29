@@ -10,7 +10,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 class ConventionalTitle(str):
@@ -39,7 +39,7 @@ class ConventionalTitle(str):
 @dataclass
 class VerificationResult:
     verified: bool
-    error_reason: Optional[str] = None
+    error_reason: str | None = None
     modified_files: list[str] = field(default_factory=list)
     diff_lines: int = 0
     pr_title: str = ""
@@ -100,7 +100,7 @@ class Verifier:
 
         return f"fix({scope}): {desc}"
 
-    def validate_reproducer_fields(self, report_data: dict[str, Any]) -> tuple[bool, Optional[str]]:
+    def validate_reproducer_fields(self, report_data: dict[str, Any]) -> tuple[bool, str | None]:
         """Validate that reproducer fields (reproducer_test_path, reproducer_verified_red) are present and verified."""
         if not report_data.get("bug_found", False):
             return True, None
@@ -146,8 +146,8 @@ class Verifier:
         skip_files: list[str],
         max_files: int = 3,
         max_lines: int = 150,
-        simulated_report: Optional[dict[str, Any]] = None,
-        custom_diff: Optional[str] = None,
+        simulated_report: dict[str, Any] | None = None,
+        custom_diff: str | None = None,
         enforce_reproducer: bool = False,
     ) -> VerificationResult:
         """Run all verification gates before committing or creating PR."""

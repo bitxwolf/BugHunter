@@ -48,6 +48,13 @@ class FixResult:
     status: str = "FAILED"
     error_message: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.error_message is not None:
+            scrubbed = str(self.error_message)
+            scrubbed = re.sub(r"(https?://)([^:\s/@]+):([^@\s/]+)@", r"\1\2:[REDACTED]@", scrubbed)
+            scrubbed = re.sub(r"(https?://)([^@\s/:]+)@([a-zA-Z0-9_.-]+)", r"\1[REDACTED]@\3", scrubbed)
+            self.error_message = redact_secrets(scrubbed)
+
 
 class MainFixerAgent:
     """Remediation Agent consuming Bug-log.md with ZERO static analysis.
@@ -144,8 +151,21 @@ class MainFixerAgent:
             return None
         scrubbed = str(text)
         token = getattr(self.config, "github_token", "") if self.config else ""
+        if not token and hasattr(self, "git_manager") and self.git_manager:
+            token = getattr(self.git_manager, "github_token", "")
+        if not token:
+            token = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN", "")
         if token and isinstance(token, str):
             scrubbed = scrubbed.replace(token, "[REDACTED]")
+            try:
+                import base64
+                auth_bytes = f"x-access-token:{token}".encode()
+                auth_b64 = base64.b64encode(auth_bytes).decode("ascii")
+                scrubbed = scrubbed.replace(auth_b64, "[REDACTED]")
+                token_b64 = base64.b64encode(token.encode("utf-8")).decode("ascii")
+                scrubbed = scrubbed.replace(token_b64, "[REDACTED]")
+            except Exception:
+                pass
         if self.git_manager and hasattr(self.git_manager, "_scrub_credentials"):
             try:
                 res = self.git_manager._scrub_credentials(scrubbed)
@@ -153,6 +173,8 @@ class MainFixerAgent:
                     scrubbed = res
             except Exception:
                 pass
+        scrubbed = re.sub(r"(https?://)([^:\s/@]+):([^@\s/]+)@", r"\1\2:[REDACTED]@", scrubbed)
+        scrubbed = re.sub(r"(https?://)([^@\s/:]+)@([a-zA-Z0-9_.-]+)", r"\1[REDACTED]@\3", scrubbed)
         return redact_secrets(scrubbed)
 
     def parse_pending_bugs(self, bug_log_path: Path) -> list[dict[str, Any]]:

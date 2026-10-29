@@ -8,10 +8,11 @@ import asyncio
 import collections
 import logging
 import re
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 
 def redact_secrets(text: str) -> str:
@@ -47,7 +48,11 @@ def redact_secrets(text: str) -> str:
     scrubbed = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{20,}", "Bearer [REDACTED]", scrubbed)
     scrubbed = re.sub(r"(?i)\bbasic\s+[A-Za-z0-9+/=]{20,}", "Basic [REDACTED]", scrubbed)
 
-    # 5. Generic credential assignments
+    # 5. Authenticated URLs (e.g. https://user:pass@host or https://token@host)
+    scrubbed = re.sub(r"(https?://)([^:\s/@]+):([^@\s/]+)@", r"\1\2:[REDACTED]@", scrubbed)
+    scrubbed = re.sub(r"(https?://)([^@\s/:]+)@([a-zA-Z0-9_.-]+)", r"\1[REDACTED]@\3", scrubbed)
+
+    # 6. Generic credential assignments
     scrubbed = re.sub(
         r"""(?i)\b(api[_-]?key|secret|token|password|auth_token)\s*([:=])\s*(['"]?)([A-Za-z0-9_\-+/=.@$!%*?&#~^]{20,})\3""",
         r"\1\2\3[REDACTED]\3",
@@ -70,13 +75,13 @@ class WebSocketBroadcaster:
 
     def __init__(self):
         self.connections: set[Any] = set()
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     def register_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Register the running asyncio event loop (e.g. from FastAPI/uvicorn)."""
         self.loop = loop
 
-    async def connect(self, websocket: Any, initial_logs: Optional[list[str]] = None) -> None:
+    async def connect(self, websocket: Any, initial_logs: list[str] | None = None) -> None:
         """Accept WebSocket connection and replay recent log lines."""
         await websocket.accept()
         self.connections.add(websocket)
@@ -120,7 +125,7 @@ class WebSocketBroadcaster:
 class RingBufferLogHandler(logging.Handler):
     """Logging handler storing messages in a memory ring buffer and broadcasting over WebSocket."""
 
-    def __init__(self, buffer: collections.deque, broadcaster: Optional[WebSocketBroadcaster] = None):
+    def __init__(self, buffer: collections.deque, broadcaster: WebSocketBroadcaster | None = None):
         super().__init__()
         self.buffer = buffer
         self.broadcaster = broadcaster
@@ -138,13 +143,13 @@ class RingBufferLogHandler(logging.Handler):
 class RingBufferLogger:
     """Fixed-capacity ring buffer logger with subscriber callbacks and optional file persistence."""
 
-    def __init__(self, capacity: int = 500, log_file: Optional[Path] = None, broadcaster: Optional[WebSocketBroadcaster] = None):
+    def __init__(self, capacity: int = 500, log_file: Path | None = None, broadcaster: WebSocketBroadcaster | None = None):
         self.capacity = capacity
         self.buffer: collections.deque = collections.deque(maxlen=capacity)
         self.subscribers: list[Callable[[str], None]] = []
         self.broadcaster: WebSocketBroadcaster = broadcaster or WebSocketBroadcaster()
         self.log_file = Path(log_file).resolve() if log_file else None
-        self._file_handler: Optional[RotatingFileHandler] = None
+        self._file_handler: RotatingFileHandler | None = None
         if self.log_file:
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
             self._file_handler = RotatingFileHandler(
@@ -162,7 +167,7 @@ class RingBufferLogger:
     def log(self, level: str, message: str) -> str:
         """Log message with timestamp prefix, append to buffer, write to disk, and broadcast."""
         sanitized_msg = redact_secrets(message)
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         entry = redact_secrets(f"[{ts}] [{level.upper()}] {sanitized_msg}")
         self.buffer.append(entry)
 
@@ -192,6 +197,8 @@ class RingBufferLogger:
 
     def get_recent_logs(self, count: int = 50) -> list[str]:
         """Return the most recent count entries from the in-memory ring buffer."""
+        if count <= 0:
+            return []
         return list(self.buffer)[-count:]
 
     def get_recent(self, count: int = 50) -> list[str]:
@@ -209,9 +216,9 @@ class RingBufferLogger:
 
 def setup_logger(
     name: str = "autobughunter",
-    log_file: Optional[Path] = None,
+    log_file: Path | None = None,
     capacity: int = 500,
-    broadcaster: Optional[WebSocketBroadcaster] = None,
+    broadcaster: WebSocketBroadcaster | None = None,
 ) -> tuple[logging.Logger, RingBufferLogger, WebSocketBroadcaster]:
     """Configure system logger with console, rotating file, ring buffer, and WebSocket broadcast."""
     ws_broadcaster = broadcaster or WebSocketBroadcaster()

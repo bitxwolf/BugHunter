@@ -16,9 +16,9 @@ import shutil
 import subprocess
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from src.logger import redact_secrets
 
@@ -101,7 +101,7 @@ class ReviewComment:
     author: str
     is_bot: bool = False
     created_at: str = ""
-    comment_database_id: Optional[int] = None
+    comment_database_id: int | None = None
 
 
 @dataclass
@@ -116,7 +116,14 @@ class ReviewRemediationResult:
     commit_sha: str = ""
     short_sha: str = ""
     status: str = "FAILED"
-    error_message: Optional[str] = None
+    error_message: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.error_message is not None:
+            scrubbed = str(self.error_message)
+            scrubbed = re.sub(r"(https?://)([^:\s/@]+):([^@\s/]+)@", r"\1\2:[REDACTED]@", scrubbed)
+            scrubbed = re.sub(r"(https?://)([^@\s/:]+)@([a-zA-Z0-9_.-]+)", r"\1[REDACTED]@\3", scrubbed)
+            self.error_message = redact_secrets(scrubbed)
 
 
 class ReviewMonitor:
@@ -132,9 +139,9 @@ class ReviewMonitor:
         database: Any,
         git_manager: Any,
         verifier: Any,
-        key_manager: Optional[Any] = None,
-        aider_runner: Optional[Any] = None,
-        logger: Optional[Any] = None,
+        key_manager: Any | None = None,
+        aider_runner: Any | None = None,
+        logger: Any | None = None,
     ):
         self.config = config
         self.db = database
@@ -165,8 +172,21 @@ class ReviewMonitor:
             return None
         scrubbed = str(text)
         token = getattr(self.config, "github_token", "") if self.config else ""
+        if not token and hasattr(self, "git_manager") and self.git_manager:
+            token = getattr(self.git_manager, "github_token", "")
+        if not token:
+            token = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN", "")
         if token and isinstance(token, str):
             scrubbed = scrubbed.replace(token, "[REDACTED]")
+            try:
+                import base64
+                auth_bytes = f"x-access-token:{token}".encode()
+                auth_b64 = base64.b64encode(auth_bytes).decode("ascii")
+                scrubbed = scrubbed.replace(auth_b64, "[REDACTED]")
+                token_b64 = base64.b64encode(token.encode("utf-8")).decode("ascii")
+                scrubbed = scrubbed.replace(token_b64, "[REDACTED]")
+            except Exception:
+                pass
         if self.git_manager and hasattr(self.git_manager, "_scrub_credentials"):
             try:
                 res = self.git_manager._scrub_credentials(scrubbed)
@@ -174,13 +194,15 @@ class ReviewMonitor:
                     scrubbed = res
             except Exception:
                 pass
+        scrubbed = re.sub(r"(https?://)([^:\s/@]+):([^@\s/]+)@", r"\1\2:[REDACTED]@", scrubbed)
+        scrubbed = re.sub(r"(https?://)([^@\s/:]+)@([a-zA-Z0-9_.-]+)", r"\1[REDACTED]@\3", scrubbed)
         return redact_secrets(scrubbed)
 
     def _log(self, message: str, level: str = "INFO") -> None:
         """Log message through configured logger, standard logger, and bughunter.log."""
         message = self._scrub(message) or ""
         level_upper = level.upper()
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{ts}] [{level_upper}] {message}"
 
         if self.logger:
@@ -214,7 +236,7 @@ class ReviewMonitor:
             env["GITHUB_TOKEN"] = token
         return env
 
-    def get_repo_path(self, repo_slug: str, existing_path: Optional[Path] = None) -> Path:
+    def get_repo_path(self, repo_slug: str, existing_path: Path | None = None) -> Path:
         """Resolve filesystem path for a target repository workspace."""
         if existing_path and Path(existing_path).exists():
             return Path(existing_path)
@@ -255,7 +277,7 @@ class ReviewMonitor:
         self,
         repo_path: Path,
         repo_slug: str,
-        pr_info: Optional[dict[str, Any]] = None,
+        pr_info: dict[str, Any] | None = None,
         is_cross_fork: bool = False,
     ) -> str:
         """
@@ -364,7 +386,7 @@ class ReviewMonitor:
             )
             return []
 
-    def execute_graphql(self, query: str, variables: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    def execute_graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         """Execute a GitHub GraphQL query or mutation via gh api graphql."""
         if not shutil.which("gh"):
             self._log("GitHub CLI 'gh' not found in PATH", level="WARNING")
@@ -646,7 +668,7 @@ class ReviewMonitor:
         repo_slug: str,
         pr_info: dict[str, Any],
         comment: ReviewComment,
-        repo_path: Optional[Path] = None,
+        repo_path: Path | None = None,
     ) -> ReviewRemediationResult:
         """
         Execute full remediation lifecycle for a single review comment thread:
@@ -853,6 +875,7 @@ class ReviewMonitor:
 
         if not patch_applied:
             from unittest.mock import Mock
+
             from src.verifier import VerificationResult
             is_mock_verifier = isinstance(self.verifier, Mock)
             has_custom_mock = (
@@ -1033,7 +1056,7 @@ class ReviewMonitor:
                 return "\n".join(lines[1:-1]).strip()
         return s
 
-    def _extract_code_from_llm_response(self, msg: str, original_code: str = "") -> Optional[str]:
+    def _extract_code_from_llm_response(self, msg: str, original_code: str = "") -> str | None:
         """Robustly extract updated code from LLM response across JSON, markdown fences, or raw text."""
         if not msg or not msg.strip():
             return None
@@ -1201,7 +1224,7 @@ class ReviewMonitor:
         return False
 
     def check_and_remediate_prs(
-        self, repo_slugs: Optional[list[str]] = None
+        self, repo_slugs: list[str] | None = None
     ) -> list[ReviewRemediationResult]:
         """
         Iterate through target repositories, inspect open bot PRs,
