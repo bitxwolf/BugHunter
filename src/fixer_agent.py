@@ -27,6 +27,7 @@ from src.bughunter_agent import (
 )
 from src.config import Config, KeyConfig
 from src.git_manager import GitManager
+from src.logger import redact_secrets
 from src.static_scanner import FiveAxisTriageEngine
 from src.verifier import Verifier
 
@@ -136,6 +137,23 @@ class MainFixerAgent:
         self.git_manager = git_manager
         self.triage_engine = FiveAxisTriageEngine()
         self._audit_lock = audit_lock or threading.Lock()
+
+    def _scrub(self, text: Any) -> str | None:
+        """Scrub tokens, credentials, and sensitive data from text or exceptions."""
+        if text is None:
+            return None
+        scrubbed = str(text)
+        token = getattr(self.config, "github_token", "") if self.config else ""
+        if token and isinstance(token, str):
+            scrubbed = scrubbed.replace(token, "[REDACTED]")
+        if self.git_manager and hasattr(self.git_manager, "_scrub_credentials"):
+            try:
+                res = self.git_manager._scrub_credentials(scrubbed)
+                if isinstance(res, str):
+                    scrubbed = res
+            except Exception:
+                pass
+        return redact_secrets(scrubbed)
 
     def parse_pending_bugs(self, bug_log_path: Path) -> list[dict[str, Any]]:
         """Parse pending unchecked bugs (- [ ]) from Bug-log.md.
@@ -333,7 +351,7 @@ class MainFixerAgent:
                 bug_id=bug_id,
                 target_file=rel_file,
                 status=aider_res.status,
-                error_message=aider_res.error_message,
+                error_message=self._scrub(aider_res.error_message),
             )
 
         # 6. Verification Gate
@@ -383,7 +401,7 @@ class MainFixerAgent:
                 target_file=rel_file,
                 diff_lines=ver_res.diff_lines,
                 status="VERIFICATION_FAILED",
-                error_message=ver_res.error_reason,
+                error_message=self._scrub(ver_res.error_reason),
             )
 
         # 7. Real Git Operations (Branch, Add, Commit, Push, PR)
@@ -437,7 +455,7 @@ class MainFixerAgent:
                             target_file=rel_file,
                             diff_lines=ver_res.diff_lines,
                             status="PUSH_FAILED",
-                            error_message=f"Git push failed: {e}",
+                            error_message=self._scrub(f"Git push failed: {e}"),
                         )
 
                 # 7d. Create PR on GitHub
@@ -493,7 +511,7 @@ class MainFixerAgent:
                                 target_file=rel_file,
                                 diff_lines=ver_res.diff_lines,
                                 status="PR_CREATION_FAILED",
-                                error_message=f"PR creation failed on GitHub: {err_msg}",
+                                error_message=self._scrub(f"PR creation failed on GitHub: {err_msg}"),
                             )
                     elif res_pr.stdout.strip().startswith("http"):
                         pr_url = res_pr.stdout.strip()
@@ -510,7 +528,7 @@ class MainFixerAgent:
                     target_file=rel_file,
                     diff_lines=ver_res.diff_lines,
                     status="GIT_OPERATION_FAILED",
-                    error_message=str(e),
+                    error_message=self._scrub(str(e)),
                 )
 
         # 8. Backlog Mutation: Mark BUG-ID as DONE (Only if PR / Git operations succeeded!)

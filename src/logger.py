@@ -41,7 +41,7 @@ def redact_secrets(text: str) -> str:
     # 3. LLM API Keys
     scrubbed = re.sub(r"sk-ant-(?:api03-)?[A-Za-z0-9_-]{20,}", "[REDACTED]", scrubbed)
     scrubbed = re.sub(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}", "[REDACTED]", scrubbed)
-    scrubbed = re.sub(r"AIza[0-9A-Za-z-_]{35}", "[REDACTED]", scrubbed)
+    scrubbed = re.sub(r"AIza[0-9A-Za-z\-_]{30,45}", "[REDACTED]", scrubbed)
 
     # 4. Bearer & Basic auth tokens
     scrubbed = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{20,}", "Bearer [REDACTED]", scrubbed)
@@ -193,6 +193,10 @@ class RingBufferLogger:
     def get_recent_logs(self, count: int = 50) -> list[str]:
         """Return the most recent count entries from the in-memory ring buffer."""
         return list(self.buffer)[-count:]
+
+    def get_recent(self, count: int = 50) -> list[str]:
+        """Alias for get_recent_logs for interface compatibility."""
+        return self.get_recent_logs(count)
 
     def close(self) -> None:
         """Close rotating file handler if open."""

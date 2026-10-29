@@ -17,6 +17,7 @@ from typing import Any, Optional
 import uvicorn
 
 from src.config import Config
+from src.aider_runner import AiderRunner
 from src.database import Database
 from src.git_manager import GitManager
 from src.key_manager import KeyManager
@@ -104,6 +105,7 @@ def main(args_list: Optional[list[str]] = None):
     static_scanner = StaticScanner(config.static_scan_timeout_seconds)
     openhands_runner = OpenHandsRunner(config.agent_timeout_seconds)
     verifier = Verifier()
+    aider_runner = AiderRunner(timeout_seconds=getattr(config, "agent_timeout_seconds", 300))
 
     orchestrator = Orchestrator(
         config=config,
@@ -114,6 +116,7 @@ def main(args_list: Optional[list[str]] = None):
         openhands_runner=openhands_runner,
         verifier=verifier,
         logger=ring_logger,
+        aider_runner=aider_runner,
     )
 
     # 6. One-Shot Mode (for GitHub Actions Cloud Runner)

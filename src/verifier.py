@@ -57,7 +57,7 @@ class Verifier:
         re.compile(r"ghp_[A-Za-z0-9_]{36,}"),
         re.compile(r"github_pat_[A-Za-z0-9_]{22,}_[A-Za-z0-9_]{50,}"),
         re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
-        re.compile(r"AIza[0-9A-Za-z-_]{35}"),
+        re.compile(r"AIza[0-9A-Za-z\-_]{30,45}"),
         re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"),
     ]
 

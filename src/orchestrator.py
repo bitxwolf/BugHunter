@@ -58,7 +58,15 @@ class Orchestrator:
         self._bugfinding_agent = bugfinding_agent
         self._fixer_agent = fixer_agent
         self._review_monitor = review_monitor
-        self.aider_runner = aider_runner
+        if aider_runner is not None:
+            self.aider_runner = aider_runner
+        else:
+            try:
+                from src.aider_runner import AiderRunner
+                timeout = getattr(self.config, "agent_timeout_seconds", 300) if self.config else 300
+                self.aider_runner = AiderRunner(timeout_seconds=timeout)
+            except Exception:
+                self.aider_runner = None
 
     @property
     def review_monitor(self) -> Any:
@@ -110,6 +118,7 @@ class Orchestrator:
                 config=self.config,
                 git_manager=self.git_manager,
                 verifier=self.verifier,
+                aider_runner=getattr(self, "aider_runner", None),
             )
         return self._fixer_agent
 

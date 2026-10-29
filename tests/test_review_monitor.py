@@ -25,10 +25,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.aider_runner import AiderResult
+from src.aider_runner import AiderResult, AiderRunner
 from src.config import Config, KeyConfig
 from src.database import Database
 from src.git_manager import GitManager
+from src.orchestrator import Orchestrator
 from src.review_monitor import (
     GRAPHQL_ADD_THREAD_REPLY,
     GRAPHQL_GET_PR_REVIEW_THREADS,
@@ -924,4 +925,326 @@ def test_review_monitor_latest_feedback_and_resolution_failure_guard(sample_conf
     assert len(rems) == 1
     assert rems[0]["status"] == "RESOLUTION_FAILED"
     assert test_db.is_thread_remediated("PRRT_multi_1") is True
+
+
+# =========================================================================
+# Milestone 12 Review Monitor Hardening Tests (R1 - R4)
+# =========================================================================
+
+def test_fetch_unresolved_review_threads_bot_already_replied_resolves_and_persists(sample_config, test_db):
+    """Verify that when bot already replied with a fix commit and no newer feedback exists:
+    1. Thread is not returned in actionable comments (no duplicate commits/re-patching).
+    2. resolve_review_thread is called.
+    3. Thread is persisted to SQLite review_remediations with extracted commit SHA.
+    """
+    git_manager = MagicMock(spec=GitManager)
+    git_manager.get_authenticated_user.return_value = "arrshh12"
+
+    monitor = ReviewMonitor(
+        config=sample_config,
+        database=test_db,
+        git_manager=git_manager,
+        verifier=MagicMock(),
+    )
+
+    graphql_resp = {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "headRefName": "fix/test-branch",
+                    "headRefOid": "abc1234567890",
+                    "reviewThreads": {
+                        "nodes": [
+                            {
+                                "id": "PRRT_already_replied",
+                                "isResolved": False,
+                                "path": "src/module.py",
+                                "line": 15,
+                                "comments": {
+                                    "nodes": [
+                                        {
+                                            "id": "PRRC_rev",
+                                            "body": "Please add null check",
+                                            "createdAt": "2026-10-25T10:00:00Z",
+                                            "author": {"login": "reviewer"},
+                                        },
+                                        {
+                                            "id": "PRRC_bot",
+                                            "body": "Noted and addressed in commit c0ffee1. Verified and resolved.",
+                                            "createdAt": "2026-10-25T10:05:00Z",
+                                            "author": {"login": "arrshh12"},
+                                        },
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+    }
+
+    with patch.object(monitor, "execute_graphql", return_value=graphql_resp), \
+         patch.object(monitor, "resolve_review_thread", return_value=True) as mock_resolve:
+        comments = monitor.fetch_unresolved_review_threads("bitxwolf/test_repo", 10, "fix/test-branch")
+
+    # 1. Did NOT return thread as actionable (no re-patch / duplicate commit)
+    assert len(comments) == 0
+
+    # 2. Called resolve_review_thread
+    mock_resolve.assert_called_once_with("PRRT_already_replied")
+
+    # 3. Persisted to SQLite
+    assert test_db.is_thread_remediated("PRRT_already_replied") is True
+    rems = test_db.get_review_remediations(pr_number=10)
+    assert len(rems) == 1
+    assert rems[0]["commit_sha"] == "c0ffee1"
+    assert rems[0]["status"] == "RESOLVED"
+
+
+def test_bot_identity_resolution_order(sample_config, test_db):
+    """Verify get_bot_identity prioritizes git_manager, respects config.bot_github_user, and defaults to arrshh12."""
+    git_manager = MagicMock(spec=GitManager)
+
+    # 1. GitManager authenticated user present
+    git_manager.get_authenticated_user.return_value = "custom_auth_bot"
+    monitor = ReviewMonitor(config=sample_config, database=test_db, git_manager=git_manager, verifier=MagicMock())
+    assert monitor.get_bot_identity() == "custom_auth_bot"
+
+    # 2. GitManager returns None, config.bot_github_user present
+    git_manager.get_authenticated_user.return_value = None
+    sample_config.bot_github_user = "cfg_bot"
+    monitor2 = ReviewMonitor(config=sample_config, database=test_db, git_manager=git_manager, verifier=MagicMock())
+    assert monitor2.get_bot_identity() == "cfg_bot"
+
+    # 3. Both None/empty -> fallback to arrshh12
+    sample_config.bot_github_user = ""
+    monitor3 = ReviewMonitor(config=sample_config, database=test_db, git_manager=git_manager, verifier=MagicMock())
+    assert monitor3.get_bot_identity() == "arrshh12"
+
+
+def test_remediate_single_thread_direct_llm_failure_aborts_cleanly(sample_config, test_db, mock_git_repo):
+    """Verify that when direct LLM patching fails, remediation aborts with LLM_PATCH_FAILED before verifier gate."""
+    subprocess.run(["git", "checkout", "-b", "fix/pr-llm-fail"], cwd=mock_git_repo, check=True, capture_output=True)
+
+    git_manager = MagicMock(spec=GitManager)
+    git_manager.rollback_working_tree = MagicMock()
+    mock_verifier = MagicMock(spec=Verifier)
+
+    monitor = ReviewMonitor(
+        config=sample_config,
+        database=test_db,
+        git_manager=git_manager,
+        verifier=mock_verifier,
+        aider_runner=None,
+    )
+
+    comment = ReviewComment(
+        comment_id="PRRC_llm_fail",
+        thread_id="PRRT_llm_fail",
+        repo_slug="bitxwolf/test_repo",
+        pr_number=30,
+        branch_name="fix/pr-llm-fail",
+        path="src_code.py",
+        line=1,
+        diff_hunk="",
+        body="Fix this",
+        author="reviewer",
+    )
+
+    with patch.object(monitor, "_run_direct_llm_remediation", return_value=False):
+        res = monitor.remediate_single_thread(
+            repo_slug="bitxwolf/test_repo",
+            pr_info={"number": 30, "headRefName": "fix/pr-llm-fail"},
+            comment=comment,
+            repo_path=mock_git_repo,
+        )
+
+    assert res.success is False
+    assert res.status == "LLM_PATCH_FAILED"
+    assert "LLM_PATCH_FAILED" in (res.error_message or "")
+    mock_verifier.verify_and_sanitize_fix.assert_not_called()
+    git_manager.rollback_working_tree.assert_called_once()
+    assert test_db.is_thread_remediated("PRRT_llm_fail") is False
+
+
+def test_remediate_single_thread_passes_repo_slug_and_non_force_to_push(sample_config, test_db, mock_git_repo):
+    """Verify push_atomic_branch receives repo_slug=repo_slug and force=False (RULE-GIT-02)."""
+    subprocess.run(["git", "checkout", "-b", "fix/pr-slug-check"], cwd=mock_git_repo, check=True, capture_output=True)
+
+    git_manager = MagicMock(spec=GitManager)
+    git_manager.push_atomic_branch = MagicMock()
+
+    mock_aider = MagicMock()
+    def mock_run_aider(repo_path, target_file, patch_instruction, key_entry=None):
+        (repo_path / target_file).write_text("def run():\n    return 999\n", encoding="utf-8")
+        return AiderResult(exit_code=0, diff_output="diff", status="SUCCESS", target_file=target_file)
+    mock_aider.run_aider.side_effect = mock_run_aider
+
+    monitor = ReviewMonitor(
+        config=sample_config,
+        database=test_db,
+        git_manager=git_manager,
+        verifier=Verifier(),
+        aider_runner=mock_aider,
+    )
+
+    comment = ReviewComment(
+        comment_id="PRRC_slug",
+        thread_id="PRRT_slug",
+        repo_slug="bitxwolf/BugHunter",
+        pr_number=45,
+        branch_name="fix/pr-slug-check",
+        path="src_code.py",
+        line=2,
+        diff_hunk="",
+        body="Return 999",
+        author="reviewer",
+    )
+
+    with patch.object(monitor, "post_inline_reply", return_value=True), \
+         patch.object(monitor, "resolve_review_thread", return_value=True):
+        res = monitor.remediate_single_thread(
+            repo_slug="bitxwolf/BugHunter",
+            pr_info={"number": 45, "headRefName": "fix/pr-slug-check"},
+            comment=comment,
+            repo_path=mock_git_repo,
+        )
+
+    assert res.success is True
+    git_manager.push_atomic_branch.assert_called_once()
+    kwargs = git_manager.push_atomic_branch.call_args.kwargs
+    assert kwargs.get("force") is False
+    assert kwargs.get("repo_slug") == "bitxwolf/BugHunter"
+
+
+def test_rule_no_automerge_strictly_enforced(sample_config, test_db):
+    """Verify ReviewMonitor.merge_pr strictly raises PermissionError (RULE-NO-AUTOMERGE)."""
+    monitor = ReviewMonitor(
+        config=sample_config,
+        database=test_db,
+        git_manager=MagicMock(),
+        verifier=MagicMock(),
+    )
+    with pytest.raises(PermissionError, match="RULE-NO-AUTOMERGE Violation"):
+        monitor.merge_pr("bitxwolf/BugHunter", 42)
+
+
+def test_default_aider_runner_initialization_and_orchestrator_wiring(sample_config, test_db):
+    """Verify default AiderRunner initialization in ReviewMonitor and wiring through Orchestrator."""
+    # 1. ReviewMonitor initializes default AiderRunner when None is passed
+    monitor = ReviewMonitor(
+        config=sample_config,
+        database=test_db,
+        git_manager=MagicMock(),
+        verifier=MagicMock(),
+        aider_runner=None,
+    )
+    assert monitor.aider_runner is not None
+    assert isinstance(monitor.aider_runner, AiderRunner)
+
+    # 2. Orchestrator initializes default AiderRunner and passes to review_monitor and fixer_agent
+    orchestrator = Orchestrator(
+        config=sample_config,
+        database=test_db,
+        key_manager=MagicMock(),
+        git_manager=MagicMock(),
+        static_scanner=MagicMock(),
+        openhands_runner=MagicMock(),
+        verifier=Verifier(),
+        logger=MagicMock(),
+        aider_runner=None,
+    )
+    assert orchestrator.aider_runner is not None
+    assert isinstance(orchestrator.aider_runner, AiderRunner)
+    assert orchestrator.review_monitor.aider_runner is orchestrator.aider_runner
+    assert orchestrator.fixer_agent.aider_runner is orchestrator.aider_runner
+
+
+def test_direct_llm_code_extraction_multi_format():
+    """Verify _extract_code_from_llm_response parses JSON, markdown fences, code inside JSON, and raw text."""
+    monitor = ReviewMonitor(
+        config=None,
+        database=None,
+        git_manager=None,
+        verifier=None,
+        aider_runner=None,
+    )
+    original = "def foo():\n    return 1\n"
+
+    # 1. Pure JSON
+    msg1 = json.dumps({"updated_full_file": "def foo():\n    return 42\n"})
+    assert monitor._extract_code_from_llm_response(msg1, original) == "def foo():\n    return 42"
+
+    # 2. Markdown fenced JSON
+    json_content = json.dumps({"updated_full_file": "def foo():\n    return 43\n"})
+    msg2 = f"```json\n{json_content}\n```"
+    assert monitor._extract_code_from_llm_response(msg2, original) == "def foo():\n    return 43"
+
+    # 3. Direct markdown code fence
+    msg3 = "Here is the fixed file:\n```python\ndef foo():\n    return 44\n```\nHope that helps!"
+    assert monitor._extract_code_from_llm_response(msg3, original) == "def foo():\n    return 44"
+
+    # 4. Code fence embedded inside JSON string
+    msg4 = json.dumps({"updated_full_file": "```python\ndef foo():\n    return 45\n```"})
+    assert monitor._extract_code_from_llm_response(msg4, original) == "def foo():\n    return 45"
+
+    # 5. Raw code text
+    msg5 = "def foo():\n    return 46\n"
+    assert monitor._extract_code_from_llm_response(msg5, original) == "def foo():\n    return 46"
+
+    # 6. Conversational refusal
+    msg6 = "I am sorry, but I cannot modify this file without more context."
+    assert monitor._extract_code_from_llm_response(msg6, original) is None
+
+    # 7. Unmodified code
+    msg7 = json.dumps({"updated_full_file": original})
+    assert monitor._extract_code_from_llm_response(msg7, original) is None
+    msg8 = f"```python\n{original}```"
+    assert monitor._extract_code_from_llm_response(msg8, original) is None
+    msg9 = f"```\n{original}```"
+    assert monitor._extract_code_from_llm_response(msg9, original) is None
+
+
+def test_remediate_single_thread_resilient_fetch_and_fork_remote_selection(sample_config, test_db, mock_git_repo):
+    """Verify PR branch fetch resilience, cross-fork remote selection, and abort when remote fails."""
+    monitor = ReviewMonitor(
+        config=sample_config,
+        database=test_db,
+        git_manager=MagicMock(has_push_access=MagicMock(return_value=False)),
+        verifier=MagicMock(),
+    )
+
+    # 1. Determine remote for cross-repository PR
+    pr_cross = {"number": 10, "isCrossRepository": True, "headRepositoryOwner": {"login": "arrshh12"}}
+    remote = monitor._determine_remote(mock_git_repo, "bitxwolf/BugHunter", pr_info=pr_cross)
+    # Since has_push_access is False or isCrossRepository is True, it targets fork
+    assert remote in ("fork", "origin")
+
+    # 2. When remotes exist but fetch fails and local branch doesn't exist, cleanly abort with CHECKOUT_FAILED
+    subprocess.run(["git", "remote", "add", "origin", "https://github.com/bitxwolf/test_repo.git"], cwd=mock_git_repo, check=True)
+
+    comment = ReviewComment(
+        comment_id="PRRC_fail_remote",
+        thread_id="PRRT_fail_remote",
+        repo_slug="bitxwolf/test_repo",
+        pr_number=99,
+        branch_name="nonexistent-remote-branch",
+        path="src_code.py",
+        line=1,
+        diff_hunk="",
+        body="Fix",
+        author="reviewer",
+    )
+
+    res = monitor.remediate_single_thread(
+        repo_slug="bitxwolf/test_repo",
+        pr_info={"number": 99, "headRefName": "nonexistent-remote-branch"},
+        comment=comment,
+        repo_path=mock_git_repo,
+    )
+    assert res.success is False
+    assert res.status == "CHECKOUT_FAILED"
+    assert "Could not reliably checkout" in (res.error_message or "")
+
 

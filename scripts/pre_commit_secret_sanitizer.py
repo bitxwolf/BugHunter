@@ -29,7 +29,7 @@ PATTERNS = {
     "github_oauth": re.compile(r"gh[ours]_[A-Za-z0-9_]{36,}"),
     "openai_key": re.compile(r"sk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{20,}"),
     "anthropic_key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),
-    "google_api_key": re.compile(r"AIza[0-9A-Za-z-_]{35}"),
+    "google_api_key": re.compile(r"AIza[0-9A-Za-z\-_]{30,45}"),
     "private_key": re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"),
     "generic_assignment": re.compile(
         r"""(?ix)

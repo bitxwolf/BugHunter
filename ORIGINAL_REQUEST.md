@@ -338,3 +338,42 @@ Integrity mode: development
 - [ ] Cross-fork `head_spec` generation and fallback verified in tests.
 - [ ] Thread resolution GraphQL call and reply posting verified in tests.
 - [ ] Idempotency verified: re-running review remediation skips already addressed threads.
+
+## Follow-up — 2026-10-25T21:01:49Z
+
+Fix the PR review comment analysis, inline reply, and GraphQL thread resolution engine in AutoBugHunter 24/7 (`src/review_monitor.py`) so that review threads across open pull requests on target repositories are reliably fetched, checked out, remediated, committed, fast-forward pushed, replied to, and resolved without breaking existing features or safety invariants.
+
+Working directory: c:\antigravity\bughunter
+Integrity mode: development
+
+## Requirements
+
+### R1. PR Branch Fetch & Fast-Forward Push Resilience
+- In `src/review_monitor.py` (`remediate_single_thread`), ensure the PR branch is reliably checked out from the exact PR head commit on GitHub using `+refs/pull/<pr_number>/head:<branch_name>` or tracking fork remotes, rather than falling back to an unanchored branch off `main`.
+- Properly determine and configure the push target remote (`fork` for cross-repo fork PRs or `origin` for same-repo PRs) so that commits are fast-forward pushes on top of the fetched PR head without requiring `--force` (enforcing `RULE-GIT-02`).
+- Pass `repo_slug=repo_slug` explicitly to `push_atomic_branch`.
+- Retain complete compatibility with local repos in unit tests (where `origin` does not exist and branches are local).
+
+### R2. Subsystem Wiring & Direct LLM Robustness
+- In `main.py` and `src/orchestrator.py`, wire and pass `AiderRunner` to `ReviewMonitor` so that surgical AST/search-replace edits are prioritized for review remediations.
+- Ensure `ReviewMonitor` initializes a default `AiderRunner` if one is not supplied.
+- In `_run_direct_llm_remediation`, robustly handle LLM outputs (cleanly extract code even if wrapped in markdown code fences or raw blocks), and if code generation fails, abort cleanly with a descriptive status (`LLM_PATCH_FAILED`) before invoking the verifier gate, preventing misleading `"Diff is completely empty"` errors.
+
+### R3. Actionable Thread Detection & Lifecycle Idempotency
+- In `fetch_unresolved_review_threads`, robustly detect whether the bot (`arrshh12`) has already replied to the thread with a fix commit. If the bot already replied and no newer feedback exists from reviewers, do not re-patch or duplicate commits; instead, attempt to resolve the thread with `resolve_review_thread(thread_id)` and persist to SQLite.
+- Ensure `bot_identity` correctly respects `config.bot_github_user` and authenticated identity.
+- Verify `post_inline_reply` and `resolve_review_thread` execute with proper error handling and logging.
+
+### R4. Non-Breaking Invariants & Test Integrity
+- All existing tests in `tests/test_review_monitor.py` and the full suite must pass with 0 regressions.
+- Absolute prohibition of `git push --force` (`RULE-GIT-02`).
+- Absolute prohibition of auto-merging (`RULE-NO-AUTOMERGE`).
+
+## Acceptance Criteria
+
+### Test Verification
+- [ ] `pytest tests/test_review_monitor.py` passes 100% (all 19+ tests green).
+- [ ] Multi-repo cross-fork PR branch fetch and push verified with simulated and dry-run tests.
+- [ ] Failed patch generation cleanly aborts with descriptive error without tripping verifier empty-diff false positives.
+- [ ] Idempotency verified: threads where the bot already replied are not re-patched with duplicate commits.
+- [ ] No regressions introduced in core orchestrator, git_manager, or database tests.
