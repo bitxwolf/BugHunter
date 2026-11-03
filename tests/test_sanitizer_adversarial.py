@@ -39,11 +39,6 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from pre_commit_secret_sanitizer import (
-    BLOCKED_NAMES,
-    BLOCKED_EXTENSIONS,
-    shannon_entropy,
-    mask_token,
-    is_blocked_file,
     scan_text_for_secrets,
 )
 from install_hooks import install_pre_commit_hook
@@ -74,7 +69,7 @@ class TestEvasiveSecretFormats:
         assert len(scan_text_for_secrets(r_snippet)) > 0, "VULNERABILITY: Raw string assignments evade detection"
 
     def test_evasion_json_quoted_keys(self):
-        """JSON / Dict format with quoted keys: `{\"api_key\": \"...\"}`."""
+        """JSON / Dict format with quoted keys: `{"api_key": "..."}`."""
         json_snippet = f'{{"api_key": "{SAMPLE_HIGH_ENTROPY}"}}'
         findings = scan_text_for_secrets(json_snippet)
         assert len(findings) > 0, "VULNERABILITY: JSON quoted keys evade detection"
