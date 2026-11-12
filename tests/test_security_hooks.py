@@ -35,7 +35,6 @@ from pre_commit_secret_sanitizer import (
     scan_text_for_secrets,
     check_blocked_file,
     is_blocked_file,
-    shannon_entropy,
     mask_token,
     PATTERNS,
     BLOCKED_NAMES,
